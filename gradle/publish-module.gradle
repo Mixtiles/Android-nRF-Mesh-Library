@@ -57,6 +57,10 @@ ext["signing.keyId"] = System.env.GPG_SIGNING_KEY
 ext["signing.password"] = System.env.GPG_PASSWORD
 ext["signing.secretKeyRingFile"] = "../sec.gpg"
 
-signing {
-    sign publishing.publications
+// Signing is only required for Maven Central; skip it when no GPG key is
+// configured (local publishing, JitPack builds of the Mixtiles fork).
+if (System.env.GPG_SIGNING_KEY != null) {
+    signing {
+        sign publishing.publications
+    }
 }
