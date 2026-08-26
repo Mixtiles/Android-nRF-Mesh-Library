@@ -775,7 +775,17 @@ abstract class LowerTransportLayer extends UpperTransportLayer {
         controlMessage.setSrc(src);
         controlMessage.setDst(dst);
         controlMessage.setIvIndex(mUpperTransportLayerCallbacks.getIvIndex());
-        final int sequenceNumber = mUpperTransportLayerCallbacks.getNode(controlMessage.getSrc()).incrementSequenceNumber();
+        // The block ack is scheduled via Handler.postDelayed — the node may have been
+        // removed from the network (resetMeshNetwork, node deletion, or a mesh import
+        // replacing the network) between scheduling and the timer firing. Without this
+        // guard the lookup returns null and the NPE kills the main thread.
+        final ProvisionedMeshNode node = mUpperTransportLayerCallbacks.getNode(controlMessage.getSrc());
+        if (node == null) {
+            MeshLogger.warn(TAG, "Node " + MeshAddress.formatAddress(controlMessage.getSrc(), true) +
+                    " no longer exists in the network — skipping block acknowledgement");
+            return;
+        }
+        final int sequenceNumber = node.incrementSequenceNumber();
         final byte[] sequenceNum = MeshParserUtils.getSequenceNumberBytes(sequenceNumber);
         controlMessage.setSequenceNumber(sequenceNum);
         mBlockAckSent = true;
