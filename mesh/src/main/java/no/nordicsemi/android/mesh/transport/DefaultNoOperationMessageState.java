@@ -545,6 +545,7 @@ class DefaultNoOperationMessageState extends MeshMessageState {
     private void handleUnknownPdu(final AccessMessage message) {
         MeshLogger.verbose(TAG, "Unknown Access PDU Received: " + MeshParserUtils.bytesToHex(message.getAccessPdu(), false));
         mMeshStatusCallbacks.onUnknownPduReceived(message.getSrc(), message.getAccessPdu());
+        mMeshStatusCallbacks.onUnknownPduReceived(message.getSrc(), message.getDst(), message.getAccessPdu());
     }
 
     /**

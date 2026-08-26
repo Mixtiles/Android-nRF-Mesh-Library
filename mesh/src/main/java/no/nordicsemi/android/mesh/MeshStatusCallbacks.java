@@ -54,6 +54,24 @@ public interface MeshStatusCallbacks {
     void onUnknownPduReceived(final int src, final byte[] accessPayload);
 
     /**
+     * Notifies if an unknown pdu was received, including the message's destination
+     * address.
+     * <p>
+     * Unsolicited access PDUs — including vendor-model messages sent by other nodes,
+     * which this library only parses into {@link no.nordicsemi.android.mesh.transport.VendorModelMessageStatus}
+     * when they are replies to a message this provisioner sent — are delivered here.
+     * The destination address is required to attribute group-addressed messages
+     * (e.g. a vendor command sent to a group by another node); the two-argument
+     * variant drops it.
+     *
+     * @param src           Address where the message originated from
+     * @param dst           Address the message was sent to (a unicast or group address)
+     * @param accessPayload Access payload of the message
+     */
+    default void onUnknownPduReceived(final int src, final int dst, final byte[] accessPayload) {
+    }
+
+    /**
      * Notifies when a block acknowledgement has been processed
      *
      * <p>
