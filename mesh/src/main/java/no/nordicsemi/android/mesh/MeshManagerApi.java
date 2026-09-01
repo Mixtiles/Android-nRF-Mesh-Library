@@ -534,7 +534,8 @@ public class MeshManagerApi implements MeshMngrApi {
         return pdu;
     }
 
-    private byte[] removeSegmentation(final int mtuSize, final byte[] data) {
+    // Package-private and static for unit testing (uses only static constants).
+    static byte[] removeSegmentation(final int mtuSize, final byte[] data) {
         int srcOffset = 0;
         int dstOffset = 0;
         final int chunks = (data.length + (mtuSize - 1)) / mtuSize;
@@ -544,12 +545,14 @@ public class MeshManagerApi implements MeshMngrApi {
             for (int i = 0; i < chunks; i++) {
                 // when removing segmentation bits we only remove the start because the pdu type would be the same for each segment.
                 // Therefore we can ignore this pdu type byte as they are already put together in the ble
-                length = Math.min(buffer.length - dstOffset, mtuSize);
+                // Chunk size must come from the remaining source, not the remaining
+                // destination: sizing from the destination double-counted the SAR octet
+                // on a short middle chunk and read past the end of `data` when the
+                // final segment carried only the SAR octet (combined length ≡ 1 mod mtu).
+                length = Math.min(data.length - srcOffset, mtuSize);
                 if (i == 0) {
                     System.arraycopy(data, srcOffset, buffer, dstOffset, length);
                     buffer[0] = (byte) (buffer[0] & GATT_SAR_UNMASK);
-                } else if (i == chunks - 1) {
-                    System.arraycopy(data, srcOffset + 1, buffer, dstOffset, length);
                 } else {
                     length = length - 1;
                     System.arraycopy(data, srcOffset + 1, buffer, dstOffset, length);
