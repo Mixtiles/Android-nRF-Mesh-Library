@@ -33,9 +33,11 @@ import java.security.Security;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Map.Entry;
 import java.util.UUID;
 
@@ -108,10 +110,27 @@ public class MeshManagerApi implements MeshMngrApi {
     private final MeshProvisioningHandler mMeshProvisioningHandler;
     private final MeshMessageHandler mMeshMessageHandler;
     private final ImportExportUtils mImportExportUtils;
-    private byte[] mIncomingBuffer;
-    private int mIncomingBufferOffset;
-    private byte[] mOutgoingBuffer;
-    private int mOutgoingBufferOffset;
+    /**
+     * GATT-layer SAR (Mesh Profile 6.3.1) reassembly state for ONE bearer.
+     * <p>
+     * The proxy protocol segments a PDU per GATT link, so reassembly must be per
+     * link too. A single shared buffer silently corrupts traffic as soon as two
+     * links deliver segmented PDUs concurrently (e.g. a PB-GATT link in proxy mode
+     * plus a second proxy that relays the same replies): interleaved segments get
+     * glued into one oversized PDU that fails decryption, and the real END segment
+     * is left orphaned in the buffer. Mirrors the iOS library, where each
+     * {@code BaseGattProxyBearer} owns its {@code ProxyProtocolHandler}.
+     */
+    static final class GattSarState {
+        byte[] incomingBuffer;
+        int incomingBufferOffset;
+        byte[] outgoingBuffer;
+        int outgoingBufferOffset;
+    }
+
+    /** Bearer key used by the legacy single-bearer overloads. */
+    private static final Object DEFAULT_BEARER = new Object();
+    private final Map<Object, GattSarState> mGattSarStates = new HashMap<>();
     private MeshNetwork mMeshNetwork;
     private boolean ivUpdateTestModeActive = false;
     private boolean allowIvIndexRecoveryOver42 = false;
@@ -234,11 +253,29 @@ public class MeshManagerApi implements MeshMngrApi {
 
     @Override
     public final void handleNotifications(final int mtuSize, @NonNull final byte[] data) {
+        handleNotifications(DEFAULT_BEARER, mtuSize, data);
+    }
+
+    /**
+     * Handles notifications received by the client, reassembling GATT-segmented
+     * PDUs per bearer.
+     * <p>
+     * Use this overload whenever more than one GATT link can deliver mesh data at
+     * the same time (several proxies, or a provisioning link in proxy mode next to
+     * a proxy). Each distinct {@code bearer} key gets its own SAR buffer, so
+     * segments interleaved across links can no longer be glued together. Call
+     * {@link #clearGattSarState(Object)} when the link closes.
+     *
+     * @param bearer  opaque key identifying the GATT link (e.g. the peripheral address)
+     * @param mtuSize mtu size supported by the device/node
+     * @param data    pdu received by the client.
+     */
+    public final void handleNotifications(@NonNull final Object bearer, final int mtuSize, @NonNull final byte[] data) {
         byte[] unsegmentedPdu;
         if (!isGattSegmented(data)) {
             unsegmentedPdu = data;
         } else {
-            final byte[] combinedPdu = appendPdu(mtuSize, data);
+            final byte[] combinedPdu = appendPdu(sarState(bearer), mtuSize, data);
             if (combinedPdu == null) {
                 //Start the timer
                 toggleProxyProtocolSarTimeOut(data);
@@ -395,11 +432,19 @@ public class MeshManagerApi implements MeshMngrApi {
 
     @Override
     public final void handleWriteCallbacks(final int mtuSize, @NonNull final byte[] data) {
+        handleWriteCallbacks(DEFAULT_BEARER, mtuSize, data);
+    }
+
+    /**
+     * Per-bearer variant of {@link #handleWriteCallbacks(int, byte[])}; see
+     * {@link #handleNotifications(Object, int, byte[])} for the bearer key contract.
+     */
+    public final void handleWriteCallbacks(@NonNull final Object bearer, final int mtuSize, @NonNull final byte[] data) {
         byte[] unsegmentedPdu;
         if (!isGattSegmented(data)) {
             unsegmentedPdu = data;
         } else {
-            final byte[] combinedPdu = appendWritePdu(mtuSize, data);
+            final byte[] combinedPdu = appendWritePdu(sarState(bearer), mtuSize, data);
             if (combinedPdu == null)
                 return;
             else {
@@ -407,6 +452,25 @@ public class MeshManagerApi implements MeshMngrApi {
             }
         }
         handleWriteCallbacks(unsegmentedPdu);
+    }
+
+    /**
+     * Drops any partially reassembled GATT segments for {@code bearer}. Call when
+     * the GATT link closes so a half-received PDU cannot be glued onto the first
+     * segment of the next connection.
+     */
+    public final void clearGattSarState(@NonNull final Object bearer) {
+        mGattSarStates.remove(bearer);
+    }
+
+    @NonNull
+    private GattSarState sarState(@NonNull final Object bearer) {
+        GattSarState state = mGattSarStates.get(bearer);
+        if (state == null) {
+            state = new GattSarState();
+            mGattSarStates.put(bearer, state);
+        }
+        return state;
     }
 
     /**
@@ -452,24 +516,38 @@ public class MeshManagerApi implements MeshMngrApi {
      * @param pdu     pdu received by the provisioner
      * @return the combine pdu or returns null if not complete.
      */
-    private byte[] appendPdu(final int mtuSize, final byte[] pdu) {
+    static byte[] appendPdu(@NonNull final GattSarState state, final int mtuSize, final byte[] pdu) {
         final int length = Math.min(pdu.length, mtuSize);
-        if (mIncomingBuffer == null) {
-            mIncomingBufferOffset = 0;
-            mIncomingBufferOffset += length;
-            mIncomingBuffer = pdu;
-        } else {
-            final byte[] buffer = new byte[mIncomingBuffer.length + length];
-            System.arraycopy(mIncomingBuffer, 0, buffer, 0, mIncomingBufferOffset);
-            System.arraycopy(pdu, 0, buffer, mIncomingBufferOffset, length);
-            mIncomingBufferOffset += length;
-            mIncomingBuffer = buffer;
-            final int sar = MeshParserUtils.unsignedByteToInt(pdu[0]) >> SAR_BIT_OFFSET;
-            if (sar == GATT_SAR_END) {
-                final byte[] packet = mIncomingBuffer;
-                mIncomingBuffer = null;
-                return packet;
+        final int sar = MeshParserUtils.unsignedByteToInt(pdu[0]) >> SAR_BIT_OFFSET;
+        if (sar == GATT_SAR_START) {
+            // A new message always starts a fresh buffer. If one was pending, the
+            // peer abandoned it (or the previous END was lost) — discard rather
+            // than glue two messages together. Same policy as the iOS
+            // ProxyProtocolHandler.
+            if (state.incomingBuffer != null) {
+                MeshLogger.warn(TAG, "Discarding incomplete GATT SAR buffer (" + state.incomingBufferOffset + " bytes) on new START segment");
             }
+            state.incomingBufferOffset = length;
+            state.incomingBuffer = pdu;
+            return null;
+        }
+        if (state.incomingBuffer == null) {
+            // CONTINUATION/END without a START: nothing to attach it to. Drop it
+            // instead of seeding the buffer with it, which would poison the next
+            // message's reassembly.
+            MeshLogger.warn(TAG, "Dropping orphan GATT SAR segment (sar=" + sar + ", " + length + " bytes) with no START buffered");
+            return null;
+        }
+        final byte[] buffer = new byte[state.incomingBuffer.length + length];
+        System.arraycopy(state.incomingBuffer, 0, buffer, 0, state.incomingBufferOffset);
+        System.arraycopy(pdu, 0, buffer, state.incomingBufferOffset, length);
+        state.incomingBufferOffset += length;
+        state.incomingBuffer = buffer;
+        if (sar == GATT_SAR_END) {
+            final byte[] packet = state.incomingBuffer;
+            state.incomingBuffer = null;
+            state.incomingBufferOffset = 0;
+            return packet;
         }
         return null;
     }
@@ -481,22 +559,21 @@ public class MeshManagerApi implements MeshMngrApi {
      * @param pdu     pdu received by the provisioner
      * @return the combine pdu or returns null if not complete.
      */
-    private byte[] appendWritePdu(final int mtuSize, final byte[] pdu) {
-        if (mOutgoingBuffer == null) {
-            final int length = Math.min(pdu.length, mtuSize);
-            mOutgoingBufferOffset = 0;
-            mOutgoingBufferOffset += length;
-            mOutgoingBuffer = pdu;
+    private static byte[] appendWritePdu(@NonNull final GattSarState state, final int mtuSize, final byte[] pdu) {
+        final int length = Math.min(pdu.length, mtuSize);
+        if (state.outgoingBuffer == null) {
+            state.outgoingBufferOffset = length;
+            state.outgoingBuffer = pdu;
         } else {
-            final int length = Math.min(pdu.length, mtuSize);
-            final byte[] buffer = new byte[mOutgoingBuffer.length + length];
-            System.arraycopy(mOutgoingBuffer, 0, buffer, 0, mOutgoingBufferOffset);
-            System.arraycopy(pdu, 0, buffer, mOutgoingBufferOffset, length);
-            mOutgoingBufferOffset += length;
-            mOutgoingBuffer = buffer;
+            final byte[] buffer = new byte[state.outgoingBuffer.length + length];
+            System.arraycopy(state.outgoingBuffer, 0, buffer, 0, state.outgoingBufferOffset);
+            System.arraycopy(pdu, 0, buffer, state.outgoingBufferOffset, length);
+            state.outgoingBufferOffset += length;
+            state.outgoingBuffer = buffer;
             if (length < mtuSize) {
-                final byte[] packet = mOutgoingBuffer;
-                mOutgoingBuffer = null;
+                final byte[] packet = state.outgoingBuffer;
+                state.outgoingBuffer = null;
+                state.outgoingBufferOffset = 0;
                 return packet;
             }
         }
