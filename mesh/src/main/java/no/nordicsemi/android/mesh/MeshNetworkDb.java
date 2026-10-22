@@ -85,9 +85,15 @@ abstract class MeshNetworkDb extends RoomDatabase {
     abstract SceneDao sceneDao();
 
     private static volatile MeshNetworkDb INSTANCE;
-    private static final int NUMBER_OF_THREADS = 4;
+    // Writes are queued as independent tasks (insertNetwork, then e.g.
+    // insert(ApplicationKey) from the onNetworkLoaded callback) and the schema
+    // ties them together with foreign keys, so they must run in submission
+    // order. A thread pool reordered them and the app key insert could land
+    // before the network row existed: SQLiteConstraintException (FOREIGN KEY)
+    // on a pool thread, killing the process on first launch. The blocking
+    // readers (submit().get()) are only called from outside the executor.
     private static final ExecutorService databaseWriteExecutor =
-            Executors.newFixedThreadPool(NUMBER_OF_THREADS);
+            Executors.newSingleThreadExecutor();
 
     /**
      * Returns the mesh database
